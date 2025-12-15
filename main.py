@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-Real-time object detection using a YOLO model and a local webcam.
-Modified to use Picamera2 for native Raspberry Pi Camera support.
+Real-time object detection using a YOLO model and a local webcam (Raspberry Pi OS optimized).
+This version uses the Picamera2 library for high FPS performance on Raspberry Pi.
 """
 
 import argparse
 import time
 import sys
 import cv2
-import numpy as np
 from ultralytics import YOLO
-from picamera2 import Picamera2 # NEW: Import Picamera2
+
+# --- ADDED IMPORTS FOR PICAMERA2 ---
+from picamera2 import Picamera2
+from libcamera import controls
+# -----------------------------------
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -19,34 +23,27 @@ def parse_args():
     parser.add_argument(
         "--model",
         type=str,
-        default="/home/aimalshah/AI/human-detection/best.pt",
-        help="Path to YOLO .pt model weights.",
+        default="/home/pi/ai/best2.pt",
+        help="Path to YOLO .pt model weights. Use a 'nano' (yolov8n.pt) model for best speed.",
     )
-    # The --cam argument is ignored by Picamera2 as it defaults to the CSI camera.
     parser.add_argument(
         "--width",
         type=int,
         default=640,
-        help="Resize width for processing (higher = slower).",
+        help="Capture width (lower = faster processing). Try 320 for maximum FPS.",
     )
     parser.add_argument(
         "--height",
         type=int,
         default=480,
-        help="Resize height for processing.",
+        help="Capture height (lower = faster processing). Try 240 for maximum FPS.",
     )
     parser.add_argument(
         "--save",
         action="store_true",
         help="Save annotated output to disk as output.avi.",
     )
-    # The original --cam argument is kept but ignored, as Picamera2 handles the CSI camera
-    parser.add_argument(
-        "--cam",
-        type=int,
-        default=0,
-        help=argparse.SUPPRESS, # Hide this argument, it's not used
-    )
+    # The --cam argument is no longer necessary as Picamera2 finds the CSI camera
     return parser.parse_args()
 
 
@@ -55,69 +52,92 @@ def main():
 
     # Load YOLO model
     try:
+        # Load model using the path from arguments
         model = YOLO(args.model)
     except Exception as e:
         print(f"❌ Error loading model '{args.model}': {e}")
-        print("Please check the path to your .pt weights.")
-        sys.exit(1)
+        return
 
-    # --- Picamera2 Setup (Replaces cv2.VideoCapture) ---
+    # --- PICAMERA2 SETUP (Replaces cv2.VideoCapture) ---
+    picam2 = None
     try:
         picam2 = Picamera2()
         
-        # Configure the camera with the desired resolution and an XRGB format
-        # XRGB is an efficient format that converts easily to OpenCV BGR
+        # Configure for fast video capture
+        # Use RGB888 format for fast camera transfer, then convert to BGR for OpenCV
         config = picam2.create_video_configuration(
-            main={"size": (args.width, args.height), "format": "XRGB8888"}
+            main={"size": (args.width, args.height), "format": "RGB888"}
         )
         picam2.configure(config)
+
+        # Optional: Set controls for better stability (e.g., disable auto focus)
+        picam2.set_controls({"AfMode": controls.AfModeEnum.Manual, "LensPosition": 0.0})
+
         picam2.start()
-
-        # Wait for auto-exposure to settle
-        time.sleep(0.5)
-        print(f"✅ Picamera2 started with resolution {args.width}x{args.height}.")
-
+        print(f"📸 Camera initialized at {args.width}x{args.height} using Picamera2.")
     except Exception as e:
-        print(f"❌ Failed to initialize Picamera2: {e}")
-        print("Please check if the camera module is connected correctly.")
-        sys.exit(1)
+        print(f"❌ Error initializing Picamera2: {e}")
+        print("Please ensure your camera is connected and the python3-picamera2 package is installed correctly.")
+        return
     # ----------------------------------------------------
 
-    # --- Video Writer Setup (OpenCV remains the same) ---
+    # Video Writer setup (if --save is used)
     writer = None
-    if args.save:
-        fourcc = cv2.VideoWriter_fourcc(*"XVID")
-        out_path = "output.avi"
-        writer = cv2.VideoWriter(out_path, fourcc, 20.0, (args.width, args.height))
-        print(f"🎥 Started saving to {out_path}")
-    
-    # --- Main Loop ---
+    fourcc = cv2.VideoWriter_fourcc(*"XVID")  # Or 'M' 'J' 'P' 'G'
+
     prev_time = 0
     show_fps = True
     
-    print("Running detection. Press 'q' to quit, 'f' for FPS toggle, 's' to start/stop save.")
+    # Get a list of the class names for labeling the boxes
+    class_names = model.names
 
     try:
         while True:
-            # 1. Capture the frame as a NumPy array (RGB format)
+            # --- FAST FRAME CAPTURE ---
+            # Capture frame as a NumPy array (RGB format)
             frame_rgb = picam2.capture_array()
-            
-            # 2. Convert from RGB (Picamera2 default) to BGR (OpenCV default)
-            # This is the standard conversion needed for cv2 functions.
+            # Convert the array to OpenCV's required BGR format
             frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            # --------------------------
 
-            # Perform detection on the frame
-            results = model(frame, verbose=False)
-            
-            # Annotate the frame with bounding boxes
-            annotated_frame = results[0].plot(
-                boxes=True, conf=True, line_width=2, font_size=0.6
+            # Run YOLO inference
+            # Using half=True significantly speeds up inference on the RPi CPU
+            results = model.predict(
+                frame, 
+                imgsz=(args.width, args.height), # Ensure YOLO processes at capture size
+                verbose=False, 
+                half=True, 
+                conf=0.4 # Use a confidence threshold to filter out weak detections
             )
-            
-            # Since .plot() is also BGR, we can use the result directly
-            frame = annotated_frame 
 
-            # --- FPS and Display Logic (Unchanged) ---
+            # Process and draw results
+            for result in results:
+                # Iterate through all detected bounding boxes
+                for box in result.boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    conf = box.conf[0]
+                    cls = int(box.cls[0])
+                    label = f"{class_names[cls]}: {conf:.2f}"
+
+                    # Draw bounding box
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    
+                    # Draw label background
+                    (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                    cv2.rectangle(frame, (x1, y1 - h - 10), (x1 + w, y1), (0, 255, 0), -1)
+
+                    # Draw label text
+                    cv2.putText(
+                        frame,
+                        label,
+                        (x1, y1 - 7),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 0, 0), # Text color black for contrast
+                        2,
+                    )
+
+            # FPS calculation and display
             cur_time = time.time()
             fps = 1 / (cur_time - prev_time) if prev_time > 0 else 0
             prev_time = cur_time
@@ -148,18 +168,18 @@ def main():
                 show_fps = not show_fps
             elif key == ord("s") and writer is None:
                 out_path = "output.avi"
-                # Re-initialize writer if saving is toggled after the script started
                 writer = cv2.VideoWriter(out_path, fourcc, 20.0, (args.width, args.height))
                 print(f"🎥 Started saving to {out_path}")
-
-
+                
     except KeyboardInterrupt:
         print("⛔ Interrupted by user.")
 
     finally:
-        # --- Clean up Picamera2 ---
-        picam2.stop()
-        # --------------------------
+        # --- CLEANUP (Replaces cap.release()) ---
+        if picam2 is not None:
+            picam2.stop()
+        # ----------------------------------------
+        
         if writer is not None:
             writer.release()
         cv2.destroyAllWindows()
