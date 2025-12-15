@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
-Real-time object detection using a YOLO model on Raspberry Pi Camera.
-Uses GStreamer backend (libcamerasrc) for stability on modern Pi OS.
+Real-time object detection using a YOLO model and a local webcam.
+Modified to use Picamera2 for native Raspberry Pi Camera support.
 """
 
 import argparse
 import time
 import sys
 import cv2
+import numpy as np
 from ultralytics import YOLO
+from picamera2 import Picamera2 # NEW: Import Picamera2
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run YOLO on Raspberry Pi using GStreamer."
+        description="Run YOLO on a local webcam (default camera index 0)."
     )
     parser.add_argument(
         "--model",
@@ -20,43 +22,33 @@ def parse_args():
         default="/home/aimalshah/AI/human-detection/best.pt",
         help="Path to YOLO .pt model weights.",
     )
+    # The --cam argument is ignored by Picamera2 as it defaults to the CSI camera.
     parser.add_argument(
         "--width",
         type=int,
         default=640,
-        help="Capture width for processing.",
+        help="Resize width for processing (higher = slower).",
     )
     parser.add_argument(
         "--height",
         type=int,
         default=480,
-        help="Capture height for processing.",
+        help="Resize height for processing.",
     )
     parser.add_argument(
         "--save",
         action="store_true",
         help="Save annotated output to disk as output.avi.",
     )
+    # The original --cam argument is kept but ignored, as Picamera2 handles the CSI camera
+    parser.add_argument(
+        "--cam",
+        type=int,
+        default=0,
+        help=argparse.SUPPRESS, # Hide this argument, it's not used
+    )
     return parser.parse_args()
 
-def open_camera(width, height):
-    """
-    Creates a GStreamer pipeline string for the Raspberry Pi Camera.
-    This bypasses the need for the problematic libcamerify wrapper.
-    """
-    # The pipeline connects the camera source (libcamerasrc) -> 
-    # sets resolution/framerate -> converts format -> sends to OpenCV (appsink).
-    gst_str = (
-        "libcamerasrc ! "
-        f"video/x-raw, width={width}, height={height}, framerate=30/1 ! "
-        "videoconvert ! "
-        "appsink"
-    )
-    print(f"🔌 Attempting GStreamer pipeline:\n   {gst_str}")
-    
-    # Use cv2.CAP_GSTREAMER to tell OpenCV to interpret the pipeline string
-    cap = cv2.VideoCapture(gst_str, cv2.CAP_GSTREAMER)
-    return cap
 
 def main():
     args = parse_args()
@@ -66,64 +58,66 @@ def main():
         model = YOLO(args.model)
     except Exception as e:
         print(f"❌ Error loading model '{args.model}': {e}")
+        print("Please check the path to your .pt weights.")
         sys.exit(1)
 
-    print("✅ Model loaded. Initializing PiCamera via GStreamer...")
+    # --- Picamera2 Setup (Replaces cv2.VideoCapture) ---
+    try:
+        picam2 = Picamera2()
+        
+        # Configure the camera with the desired resolution and an XRGB format
+        # XRGB is an efficient format that converts easily to OpenCV BGR
+        config = picam2.create_video_configuration(
+            main={"size": (args.width, args.height), "format": "XRGB8888"}
+        )
+        picam2.configure(config)
+        picam2.start()
 
-    # Initialize Camera using GStreamer
-    cap = open_camera(args.width, args.height)
+        # Wait for auto-exposure to settle
+        time.sleep(0.5)
+        print(f"✅ Picamera2 started with resolution {args.width}x{args.height}.")
 
-    if not cap.isOpened():
-        print("❌ Error: Could not open camera via GStreamer.")
-        print("   Make sure the following package is installed:")
-        print("   sudo apt install gstreamer1.0-libcamera")
+    except Exception as e:
+        print(f"❌ Failed to initialize Picamera2: {e}")
+        print("Please check if the camera module is connected correctly.")
         sys.exit(1)
+    # ----------------------------------------------------
 
-    print("✅ PiCam connected! Press 'q' to quit, 'f' to toggle FPS.")
-
-    # Video Writer setup
+    # --- Video Writer Setup (OpenCV remains the same) ---
     writer = None
     if args.save:
         fourcc = cv2.VideoWriter_fourcc(*"XVID")
         out_path = "output.avi"
         writer = cv2.VideoWriter(out_path, fourcc, 20.0, (args.width, args.height))
-        print(f"🎥 Saving video to {out_path}")
-
+        print(f"🎥 Started saving to {out_path}")
+    
+    # --- Main Loop ---
     prev_time = 0
     show_fps = True
+    
+    print("Running detection. Press 'q' to quit, 'f' for FPS toggle, 's' to start/stop save.")
 
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                print("❌ Failed to grab frame.")
-                break
+            # 1. Capture the frame as a NumPy array (RGB format)
+            frame_rgb = picam2.capture_array()
+            
+            # 2. Convert from RGB (Picamera2 default) to BGR (OpenCV default)
+            # This is the standard conversion needed for cv2 functions.
+            frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
-            # YOLO inference
-            results = model(frame)
-            res = results[0]
+            # Perform detection on the frame
+            results = model(frame, verbose=False)
+            
+            # Annotate the frame with bounding boxes
+            annotated_frame = results[0].plot(
+                boxes=True, conf=True, line_width=2, font_size=0.6
+            )
+            
+            # Since .plot() is also BGR, we can use the result directly
+            frame = annotated_frame 
 
-            # Draw detections
-            if hasattr(res, "boxes") and len(res.boxes) > 0:
-                for box in res.boxes:
-                    xyxy = box.xyxy[0].cpu().numpy()
-                    x1, y1, x2, y2 = map(int, xyxy.tolist())
-                    conf = float(box.conf[0])
-                    cls = int(box.cls[0])
-                    label = model.names.get(cls, str(cls)) if hasattr(model, "names") else str(cls)
-
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.putText(
-                        frame,
-                        f"{label} {conf:.2f}",
-                        (x1, max(20, y1 - 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (0, 255, 0),
-                        2,
-                    )
-
-            # FPS Calculation
+            # --- FPS and Display Logic (Unchanged) ---
             cur_time = time.time()
             fps = 1 / (cur_time - prev_time) if prev_time > 0 else 0
             prev_time = cur_time
@@ -139,26 +133,38 @@ def main():
                     2,
                 )
 
-            cv2.imshow("PiCam YOLO Detection", frame)
+            # Display window
+            cv2.imshow("YOLO Webcam Detection", frame)
 
+            # Save frame if recording
             if writer is not None:
                 writer.write(frame)
 
+            # Keyboard controls
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
             elif key == ord("f"):
                 show_fps = not show_fps
+            elif key == ord("s") and writer is None:
+                out_path = "output.avi"
+                # Re-initialize writer if saving is toggled after the script started
+                writer = cv2.VideoWriter(out_path, fourcc, 20.0, (args.width, args.height))
+                print(f"🎥 Started saving to {out_path}")
+
 
     except KeyboardInterrupt:
-        print("⛔ Interrupted.")
+        print("⛔ Interrupted by user.")
 
     finally:
-        cap.release()
+        # --- Clean up Picamera2 ---
+        picam2.stop()
+        # --------------------------
         if writer is not None:
             writer.release()
         cv2.destroyAllWindows()
         print("✅ Cleaned up and exited successfully.")
+
 
 if __name__ == "__main__":
     main()
