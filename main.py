@@ -12,7 +12,8 @@ from ultralytics import YOLO
 
 # --- ADDED IMPORTS FOR PICAMERA2 ---
 from picamera2 import Picamera2
-from libcamera import controls
+# We no longer need 'from libcamera import controls'
+# as we removed the unsupported set_controls line
 # -----------------------------------
 
 
@@ -26,6 +27,7 @@ def parse_args():
         default="/home/pi/ai/best2.pt",
         help="Path to YOLO .pt model weights. Use a 'nano' (yolov8n.pt) model for best speed.",
     )
+    # Removed the unused --cam argument as Picamera2 finds the CSI camera
     parser.add_argument(
         "--width",
         type=int,
@@ -43,7 +45,6 @@ def parse_args():
         action="store_true",
         help="Save annotated output to disk as output.avi.",
     )
-    # The --cam argument is no longer necessary as Picamera2 finds the CSI camera
     return parser.parse_args()
 
 
@@ -52,7 +53,6 @@ def main():
 
     # Load YOLO model
     try:
-        # Load model using the path from arguments
         model = YOLO(args.model)
     except Exception as e:
         print(f"❌ Error loading model '{args.model}': {e}")
@@ -63,16 +63,14 @@ def main():
     try:
         picam2 = Picamera2()
         
-        # Configure for fast video capture
+        # 1. Configure for fast video capture
         # Use RGB888 format for fast camera transfer, then convert to BGR for OpenCV
         config = picam2.create_video_configuration(
             main={"size": (args.width, args.height), "format": "RGB888"}
         )
         picam2.configure(config)
 
-        # Optional: Set controls for better stability (e.g., disable auto focus)
-        picam2.set_controls({"AfMode": controls.AfModeEnum.Manual, "LensPosition": 0.0})
-
+        # 2. Start the camera
         picam2.start()
         print(f"📸 Camera initialized at {args.width}x{args.height} using Picamera2.")
     except Exception as e:
@@ -84,6 +82,13 @@ def main():
     # Video Writer setup (if --save is used)
     writer = None
     fourcc = cv2.VideoWriter_fourcc(*"XVID")  # Or 'M' 'J' 'P' 'G'
+    
+    # Optional: Initializing writer if --save is passed at startup
+    if args.save:
+        out_path = "output.avi"
+        writer = cv2.VideoWriter(out_path, fourcc, 20.0, (args.width, args.height))
+        print(f"🎥 Saving video to {out_path}")
+
 
     prev_time = 0
     show_fps = True
@@ -93,49 +98,48 @@ def main():
 
     try:
         while True:
-            # --- FAST FRAME CAPTURE ---
+            # --- FAST FRAME CAPTURE (Replaces cap.read()) ---
             # Capture frame as a NumPy array (RGB format)
             frame_rgb = picam2.capture_array()
             # Convert the array to OpenCV's required BGR format
             frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-            # --------------------------
+            # ----------------------------------------------
 
             # Run YOLO inference
-            # Using half=True significantly speeds up inference on the RPi CPU
+            # Using half=True is CRITICAL for speeding up inference on the RPi CPU
             results = model.predict(
                 frame, 
                 imgsz=(args.width, args.height), # Ensure YOLO processes at capture size
                 verbose=False, 
-                half=True, 
+                half=True, # Optimized for speed
                 conf=0.4 # Use a confidence threshold to filter out weak detections
             )
 
             # Process and draw results
             for result in results:
                 # Iterate through all detected bounding boxes
-                for box in result.boxes:
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    conf = box.conf[0]
-                    cls = int(box.cls[0])
-                    label = f"{class_names[cls]}: {conf:.2f}"
-
-                    # Draw bounding box
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    
-                    # Draw label background
-                    (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                    cv2.rectangle(frame, (x1, y1 - h - 10), (x1 + w, y1), (0, 255, 0), -1)
-
-                    # Draw label text
-                    cv2.putText(
-                        frame,
-                        label,
-                        (x1, y1 - 7),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (0, 0, 0), # Text color black for contrast
-                        2,
-                    )
+                if hasattr(result, "boxes"):
+                    for box in result.boxes:
+                        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                        conf = float(box.conf[0])
+                        cls = int(box.cls[0])
+                        label = f"{class_names.get(cls, str(cls))}: {conf:.2f}"
+    
+                        # Draw bounding box
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        
+                        # Draw label background and text
+                        (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                        cv2.rectangle(frame, (x1, y1 - h - 10), (x1 + w, y1), (0, 255, 0), -1)
+                        cv2.putText(
+                            frame,
+                            label,
+                            (x1, y1 - 7),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6,
+                            (0, 0, 0), # Text color black for contrast
+                            2,
+                        )
 
             # FPS calculation and display
             cur_time = time.time()
