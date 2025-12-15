@@ -2,7 +2,7 @@
 """
 Real-time object detection using a YOLO model and a local webcam (Raspberry Pi OS optimized).
 This version uses the Picamera2 library for high FPS performance on Raspberry Pi.
-OPTIMIZED FOR 20-30 FPS with better detection accuracy.
+OPTIMIZED FOR 20-30 FPS with good detection accuracy.
 """
 
 import argparse
@@ -21,26 +21,32 @@ def parse_args():
     parser.add_argument(
         "--model",
         type=str,
-        default="/home/pi/ai/best2.pt",
+        default="/home/aimalshah/AI/human-detection/best.pt",
         help="Path to YOLO .pt model weights. Use a 'nano' (yolov8n.pt) model for best speed.",
     )
     parser.add_argument(
         "--width",
         type=int,
-        default=416,
-        help="Capture width (lower = faster processing). 416 is optimal for YOLO.",
+        default=320,  # Lower resolution for speed
+        help="Capture width (lower = faster processing).",
     )
     parser.add_argument(
         "--height",
         type=int,
-        default=416,
-        help="Capture height (lower = faster processing). 416 is optimal for YOLO.",
+        default=320,  # Lower resolution for speed
+        help="Capture height (lower = faster processing).",
+    )
+    parser.add_argument(
+        "--inference-size",
+        type=int,
+        default=320,  # Match capture size
+        help="YOLO inference size (lower = faster).",
     )
     parser.add_argument(
         "--skip-frames",
         type=int,
-        default=1,
-        help="Process every Nth frame (1=all, 2=every other). Default 1 for best detection.",
+        default=3,
+        help="Process every Nth frame (default 3 for speed).",
     )
     parser.add_argument(
         "--save",
@@ -57,12 +63,7 @@ def main():
     try:
         print("🔄 Loading YOLO model...")
         model = YOLO(args.model)
-        
-        # Warm up the model with a dummy inference
-        dummy = np.zeros((args.height, args.width, 3), dtype=np.uint8)
-        model.predict(dummy, imgsz=416, verbose=False, half=True)
-        
-        print("✅ Model loaded and warmed up")
+        print("✅ Model loaded")
     except Exception as e:
         print(f"❌ Error loading model '{args.model}': {e}")
         return
@@ -72,24 +73,19 @@ def main():
     try:
         picam2 = Picamera2()
         
-        # Configure for maximum speed with lower resolution
+        # Configure for speed - lower resolution
         config = picam2.create_video_configuration(
-            main={"size": (args.width, args.height), "format": "RGB888"},
-            controls={"FrameRate": 30}
+            main={"size": (args.width, args.height), "format": "RGB888"}
         )
         picam2.configure(config)
-        
-        # Set additional controls for faster operation
-        picam2.set_controls({
-            "ExposureTime": 10000,  # Faster exposure (adjust if too dark)
-            "AnalogueGain": 2.0      # Compensate for faster exposure
-        })
-        
         picam2.start()
-        print(f"📸 Camera initialized at {args.width}x{args.height} @ 30 FPS")
+        print(f"📸 Camera initialized at {args.width}x{args.height}")
         
-        # Let camera warm up
-        time.sleep(0.5)
+        # Quick warmup
+        time.sleep(0.3)
+        for _ in range(5):
+            _ = picam2.capture_array()
+            
     except Exception as e:
         print(f"❌ Error initializing Picamera2: {e}")
         return
@@ -103,99 +99,91 @@ def main():
         writer = cv2.VideoWriter(out_path, fourcc, 20.0, (args.width, args.height))
         print(f"🎥 Saving video to {out_path}")
 
-    prev_time = 0
+    prev_time = time.time()
     show_fps = True
     frame_count = 0
     class_names = model.names
+    
+    # Store last detection results
+    last_boxes = []
 
-    print(f"⚡ Processing every {args.skip_frames} frame(s)")
+    print(f"⚡ Processing every {args.skip_frames} frame(s) at {args.inference_size}x{args.inference_size}")
     print("Controls: Q=quit, F=toggle FPS, S=start recording")
-
-    # Pre-allocate frame for speed
-    last_annotated_frame = None
 
     try:
         while True:
-            loop_start = time.time()
-            
-            # Capture frame (fast operation)
+            # Capture frame
             frame_rgb = picam2.capture_array()
             frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
             
-            # Process frame with YOLO
+            # Run inference only on every Nth frame
             if frame_count % args.skip_frames == 0:
                 try:
-                    # Run YOLO inference with optimized settings
+                    # CRITICAL: Use smaller inference size and optimized settings
                     results = model.predict(
                         frame,
-                        imgsz=416,  # Fixed size for speed
+                        imgsz=args.inference_size,  # Small size for speed
                         verbose=False,
-                        half=True,  # FP16 for speed
-                        conf=0.35,  # Slightly lower confidence for better detection
-                        iou=0.5,    # IoU threshold for NMS
+                        half=False,  # Disable FP16 if causing issues
+                        conf=0.4,
+                        iou=0.45,
                         device='cpu',
-                        max_det=15,  # Allow more detections
-                        agnostic_nms=True  # Faster NMS
+                        max_det=10,
+                        agnostic_nms=True,
+                        classes=None  # Detect all classes
                     )
-
-                    # Draw detections
+                    
+                    # Extract boxes for reuse
+                    last_boxes = []
                     for result in results:
                         if hasattr(result, "boxes") and result.boxes is not None:
                             for box in result.boxes:
-                                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                                conf = float(box.conf[0])
-                                cls = int(box.cls[0])
-                                label = f"{class_names.get(cls, str(cls))}: {conf:.2f}"
-
-                                # Draw bounding box
-                                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                                last_boxes.append({
+                                    'xyxy': box.xyxy[0].tolist(),
+                                    'conf': float(box.conf[0]),
+                                    'cls': int(box.cls[0])
+                                })
                                 
-                                # Draw label background and text
-                                (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                                cv2.rectangle(frame, (x1, y1 - h - 8), (x1 + w, y1), (0, 255, 0), -1)
-                                cv2.putText(
-                                    frame,
-                                    label,
-                                    (x1, y1 - 5),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.5,
-                                    (0, 0, 0),
-                                    1,
-                                )
-                    
-                    last_annotated_frame = frame.copy()
-                    
                 except Exception as e:
                     print(f"⚠️  Inference error: {e}")
-            else:
-                # Use last annotated frame if we're skipping
-                if last_annotated_frame is not None:
-                    frame = last_annotated_frame.copy()
+
+            # Draw boxes (fast operation, done every frame)
+            for box_data in last_boxes:
+                x1, y1, x2, y2 = map(int, box_data['xyxy'])
+                conf = box_data['conf']
+                cls = box_data['cls']
+                label = f"{class_names.get(cls, str(cls))}: {conf:.2f}"
+
+                # Draw bounding box
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                
+                # Draw label
+                (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+                cv2.rectangle(frame, (x1, y1 - h - 6), (x1 + w, y1), (0, 255, 0), -1)
+                cv2.putText(
+                    frame, label, (x1, y1 - 3),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1
+                )
 
             # FPS calculation
             cur_time = time.time()
-            fps = 1 / (cur_time - prev_time) if prev_time > 0 else 0
+            fps = 1 / (cur_time - prev_time)
             prev_time = cur_time
 
             if show_fps:
                 cv2.putText(
-                    frame,
-                    f"FPS: {fps:.1f}",
-                    (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 255),
-                    2,
+                    frame, f"FPS: {fps:.1f}", (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2
                 )
 
-            # Display window
+            # Display
             cv2.imshow("YOLO Webcam Detection", frame)
 
-            # Save frame if recording
+            # Save if recording
             if writer is not None:
                 writer.write(frame)
 
-            # Keyboard controls
+            # Controls
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
