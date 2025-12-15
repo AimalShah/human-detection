@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 """
-Real-time object detection using a YOLO model on Raspberry Pi.
-Optimized for use with 'libcamerify'.
-
-Usage:
-  libcamerify python3 main.py
+Real-time object detection using a YOLO model on Raspberry Pi Camera.
+Uses GStreamer backend (libcamerasrc) for stability on modern Pi OS.
 """
 
 import argparse
@@ -13,10 +10,9 @@ import sys
 import cv2
 from ultralytics import YOLO
 
-
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run YOLO on a local webcam (default camera index 0)."
+        description="Run YOLO on Raspberry Pi using GStreamer."
     )
     parser.add_argument(
         "--model",
@@ -25,22 +21,16 @@ def parse_args():
         help="Path to YOLO .pt model weights.",
     )
     parser.add_argument(
-        "--cam",
-        type=int,
-        default=0,
-        help="Camera index (0 = default webcam).",
-    )
-    parser.add_argument(
         "--width",
         type=int,
         default=640,
-        help="Resize width for processing (higher = slower).",
+        help="Capture width for processing.",
     )
     parser.add_argument(
         "--height",
         type=int,
         default=480,
-        help="Resize height for processing.",
+        help="Capture height for processing.",
     )
     parser.add_argument(
         "--save",
@@ -49,6 +39,24 @@ def parse_args():
     )
     return parser.parse_args()
 
+def open_camera(width, height):
+    """
+    Creates a GStreamer pipeline string for the Raspberry Pi Camera.
+    This bypasses the need for the problematic libcamerify wrapper.
+    """
+    # The pipeline connects the camera source (libcamerasrc) -> 
+    # sets resolution/framerate -> converts format -> sends to OpenCV (appsink).
+    gst_str = (
+        "libcamerasrc ! "
+        f"video/x-raw, width={width}, height={height}, framerate=30/1 ! "
+        "videoconvert ! "
+        "appsink"
+    )
+    print(f"🔌 Attempting GStreamer pipeline:\n   {gst_str}")
+    
+    # Use cv2.CAP_GSTREAMER to tell OpenCV to interpret the pipeline string
+    cap = cv2.VideoCapture(gst_str, cv2.CAP_GSTREAMER)
+    return cap
 
 def main():
     args = parse_args()
@@ -60,41 +68,23 @@ def main():
         print(f"❌ Error loading model '{args.model}': {e}")
         sys.exit(1)
 
-    print(f"✅ Model loaded. Attempting to open camera index {args.cam}...")
+    print("✅ Model loaded. Initializing PiCamera via GStreamer...")
 
-    # --- KEY CHANGE: Force V4L2 Backend ---
-    # We use cv2.CAP_V4L2 to ensure it plays nicely with libcamerify
-    cap = cv2.VideoCapture(args.cam, cv2.CAP_V4L2)
-    
-    # --- KEY CHANGE: Force MJPG Format ---
-    # This prevents the 'select timeout' or empty frame errors by using compressed video
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
-    
-    # Set Resolution
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    cap.set(cv2.CAP_PROP_FPS, 30)
+    # Initialize Camera using GStreamer
+    cap = open_camera(args.width, args.height)
 
     if not cap.isOpened():
-        print(f"❌ Error: Could not open webcam index {args.cam}.")
+        print("❌ Error: Could not open camera via GStreamer.")
+        print("   Make sure the following package is installed:")
+        print("   sudo apt install gstreamer1.0-libcamera")
         sys.exit(1)
 
-    # Warmup: Read a dummy frame to ensure the stream is actually ready
-    ret, _ = cap.read()
-    if not ret:
-        print("⚠️ Warning: Initial frame read failed. Retrying...")
-        time.sleep(1)
-        ret, _ = cap.read()
-        if not ret:
-            print("❌ Error: Camera opened but failed to return frames.")
-            sys.exit(1)
+    print("✅ PiCam connected! Press 'q' to quit, 'f' to toggle FPS.")
 
-    print("✅ Webcam connected. Press 'q' to quit, 's' to start saving video.")
-
-    # Optional: video writer setup
+    # Video Writer setup
     writer = None
-    fourcc = cv2.VideoWriter_fourcc(*"XVID")
     if args.save:
+        fourcc = cv2.VideoWriter_fourcc(*"XVID")
         out_path = "output.avi"
         writer = cv2.VideoWriter(out_path, fourcc, 20.0, (args.width, args.height))
         print(f"🎥 Saving video to {out_path}")
@@ -107,11 +97,10 @@ def main():
             ret, frame = cap.read()
             if not ret:
                 print("❌ Failed to grab frame.")
-                # Sometimes on Pi, a single dropped frame happens. Don't exit immediately.
-                continue 
+                break
 
             # YOLO inference
-            results = model(frame) # YOLO handles resizing internally, usually better than manual resize
+            results = model(frame)
             res = results[0]
 
             # Draw detections
@@ -134,7 +123,7 @@ def main():
                         2,
                     )
 
-            # FPS display
+            # FPS Calculation
             cur_time = time.time()
             fps = 1 / (cur_time - prev_time) if prev_time > 0 else 0
             prev_time = cur_time
@@ -150,26 +139,19 @@ def main():
                     2,
                 )
 
-            # Display window
-            cv2.imshow("YOLO Webcam Detection", frame)
+            cv2.imshow("PiCam YOLO Detection", frame)
 
-            # Save frame if recording
             if writer is not None:
                 writer.write(frame)
 
-            # Keyboard controls
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
             elif key == ord("f"):
                 show_fps = not show_fps
-            elif key == ord("s") and writer is None:
-                out_path = "output.avi"
-                writer = cv2.VideoWriter(out_path, fourcc, 20.0, (args.width, args.height))
-                print(f"🎥 Started saving to {out_path}")
 
     except KeyboardInterrupt:
-        print("⛔ Interrupted by user.")
+        print("⛔ Interrupted.")
 
     finally:
         cap.release()
@@ -177,7 +159,6 @@ def main():
             writer.release()
         cv2.destroyAllWindows()
         print("✅ Cleaned up and exited successfully.")
-
 
 if __name__ == "__main__":
     main()
